@@ -1,0 +1,6 @@
+gen_file/*/
+__pycache__
+gen_dataset/*/
+!gen_dataset/VVCSoftware_VTM-VTM-10.2-dataset/
+!gen_dataset/VVCSoftware_VTM-VTM-10.2-dataset/**
+train_model/*/

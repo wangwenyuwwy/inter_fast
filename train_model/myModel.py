@@ -1,0 +1,1315 @@
+import math
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+#from my_nfnet import BasicBlock
+#from nfnets import *
+
+def conv3x3(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
+    """3x3 convolution with padding."""
+    return nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
+
+
+def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
+    """3x3 sub-pixel convolution for up-sampling."""
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch * r ** 2, kernel_size=3, padding=1), nn.PixelShuffle(r)
+    )
+
+def conv1x1(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
+    """1x1 convolution."""
+    return nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride)
+def window_partition(x, window_size=8):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size[0], window_size[0], W // window_size[1], window_size[1], C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size[0], window_size[1], C)
+
+    return windows
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size[0] / window_size[1]))
+    x = windows.view(B, H // window_size[0], W // window_size[1], window_size[0], window_size[1], -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+class WindowAttention(nn.Module):
+    """ Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+    Args:
+        dim (int): Number of input channels.
+        window_size (tuple[int]): The height and width of the window.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    """
+
+    def __init__(self, dim=192, window_size=(8, 8), num_heads=8, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # define a parameter table of relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """ Forward function.
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+        
+class WinBasedAttention(nn.Module):
+    r""" Swin Transformer Block.
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resulotion.
+        num_heads (int): Number of attention heads.
+        window_size (int): Window size.
+        shift_size (int): Shift size for SW-MSA.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim=192, num_heads=8, window_size=8, shift_size=0,
+                 qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        self.attn = WindowAttention(
+            dim, window_size=to_2tuple(self.window_size) if self.window_size is not tuple else self.window_size, num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        shortcut = x
+        x = x.permute(0, 2, 3, 1)
+
+
+        if self.shift_size > 0:
+            # calculate attention mask for SW-MSA
+            img_mask = torch.zeros((1, H, W, 1), device=x.device)
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+
+            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size[0] * self.window_size[1], C)
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=attn_mask)
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size[0], self.window_size[1], C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            print("error!!!!!!")
+            #x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = shortcut + self.drop_path(x)
+
+        return x
+
+class Win_noShift_Attention(nn.Module):
+    """Window-based self-attention module."""
+
+    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0):
+        super().__init__()
+        N = dim
+
+        class ResidualUnit(nn.Module):
+            def __init__(self,ch_in=16,ch_out=16):
+                super().__init__()
+                self.ch_in=ch_in
+                self.ch_out=ch_out
+                self.net = nn.Sequential(
+                    nn.Conv2d(ch_in, ch_out, kernel_size=3,stride=1,padding=1,bias=True),
+                    nn.BatchNorm2d(ch_out),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(ch_out, ch_out, kernel_size=3,stride=1,padding=1,bias=True),
+                    nn.BatchNorm2d(ch_out),
+                    nn.ReLU(inplace=True),
+                )
+                self.cov=nn.Conv2d(self.ch_in, self.ch_out, kernel_size=1,stride=1,padding=0,bias=True)
+                self.rel=nn.ReLU(inplace=True)
+
+            def forward(self,x):
+                x1 = self.net(x)
+                x3=x1+x
+                return x3
+        
+
+        self.conv_a = nn.Sequential(ResidualUnit(), ResidualUnit(), ResidualUnit())
+
+        self.conv_b = nn.Sequential(
+            WinBasedAttention(dim=dim, num_heads=num_heads, window_size=window_size, shift_size=shift_size),
+            ResidualUnit(),
+            ResidualUnit(),
+            ResidualUnit(),
+            conv1x1(N, N),
+        )
+    def forward(self, x):
+        identity = x
+        a = self.conv_a(x)
+        b = self.conv_b(x)
+        out = a * torch.sigmoid(b)
+        out += identity
+        return out
+
+
+class Win_noShift_Attention(nn.Module):
+  """Window-based self-attention module."""
+
+  def __init__(self, dim, num_heads=8, window_size=8, shift_size=0):
+    super().__init__()
+    N = dim
+
+    class ResidualUnit(nn.Module):
+      def __init__(self, ch_in=16, ch_out=16):
+        super().__init__()
+        self.ch_in = ch_in
+        self.ch_out = ch_out
+        self.net = nn.Sequential(
+          nn.Conv2d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+          nn.BatchNorm2d(ch_out),
+          nn.ReLU(inplace=True),
+          nn.Conv2d(ch_out, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+          nn.BatchNorm2d(ch_out),
+          nn.ReLU(inplace=True),
+        )
+        self.cov = nn.Conv2d(self.ch_in, self.ch_out, kernel_size=1, stride=1, padding=0, bias=True)
+        self.rel = nn.ReLU(inplace=True)
+
+      def forward(self, x):
+        x1 = self.net(x)
+        x3 = x1 + x
+        return x3
+
+    self.conv_a = nn.Sequential(ResidualUnit(), ResidualUnit(), ResidualUnit())
+
+    self.conv_b = nn.Sequential(
+      WinBasedAttention(dim=dim, num_heads=num_heads, window_size=window_size, shift_size=shift_size),
+      ResidualUnit(),
+      ResidualUnit(),
+      ResidualUnit(),
+      conv1x1(N, N),
+    )
+
+  def forward(self, x):
+    identity = x
+    a = self.conv_a(x)
+    b = self.conv_b(x)
+    out = a * torch.sigmoid(b)
+    out += identity
+    return out
+
+class ECALayer(nn.Module):
+  def __init__(self, channels, gamma=2, b=1):
+    super().__init__()
+    k_size = int(abs((math.log2(channels) + b) / gamma))
+    k_size = k_size if k_size % 2 else k_size + 1
+    self.avg_pool = nn.AdaptiveAvgPool2d(1)
+    self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+    self.sigmoid = nn.Sigmoid()
+
+  def forward(self, x):
+    y = self.avg_pool(x)
+    y = self.conv(y.squeeze(-1).transpose(-1, -2))
+    y = y.transpose(-1, -2).unsqueeze(-1)
+    y = self.sigmoid(y)
+    return x * y.expand_as(x)
+
+
+
+class GhostECABlock(nn.Module):
+  def __init__(self, in_chs=16, out_chs=16, exp_size=8, kernel_size=3, stride=1, reduction=4):
+    super().__init__()
+    # Ghost Block原始结构
+    self.primary_conv = nn.Sequential(
+      nn.Conv2d(in_chs, exp_size, kernel_size, stride, kernel_size // 2, bias=False),
+      nn.BatchNorm2d(exp_size),
+      nn.ReLU(inplace=True)
+    )
+    self.cheap_conv = nn.Sequential(
+      nn.Conv2d(exp_size, exp_size, kernel_size, 1, kernel_size // 2, groups=exp_size, bias=False),
+      nn.BatchNorm2d(exp_size),
+      nn.ReLU(inplace=True)
+    )
+    # 合并特征图后的ECA
+    self.combine = nn.Conv2d(exp_size * 2, out_chs, 1, 1, 0, bias=False)
+    self.eca = ECALayer(out_chs)  # 需提前定义ECA模块
+
+  def forward(self, x):
+    x1 = self.primary_conv(x)
+    x2 = self.cheap_conv(x1)
+    out = torch.cat([x1, x2], dim=1)
+    out = self.combine(out)
+    out = self.eca(out)  # 在合并后应用ECA
+    return out
+
+
+class GENet(nn.Module):
+  def __init__(self, in_chs=16, out_chs=16, exp_size=8, kernel_size=3, stride=1, reduction=4):
+    super().__init__()
+    self.GhostECABlocks = nn.Sequential(
+      GhostECABlock(in_chs, out_chs, exp_size, kernel_size, stride, reduction),
+      GhostECABlock(in_chs, out_chs, exp_size, kernel_size, stride, reduction),
+      GhostECABlock(in_chs, out_chs, exp_size, kernel_size, stride, reduction)
+    )
+
+  def forward(self, x):
+    y = self.GhostECABlocks(x)
+    return y+x
+
+class QPConditionalEncoder(nn.Module):
+  def __init__(self, image_channels=16, qp_embed_dim=8):
+    super().__init__()
+    self.embed = nn.Embedding(num_embeddings=4, embedding_dim=qp_embed_dim)
+
+    # 自适应缩放 (与图像通道数关联)
+    self.scale = nn.Parameter(torch.ones(qp_embed_dim) * 0.5)
+    self.bias = nn.Parameter(torch.zeros(qp_embed_dim))
+
+  def forward(self, qp_indices, spatial_shape):
+    x = self.embed(qp_indices)  # [B, qp_embed_dim]
+    x = x * self.scale + self.bias
+    return x.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, *spatial_shape)
+
+
+# 特征融合层（关键设计）
+class FusionBlock(nn.Module):
+  def __init__(self, image_channels=16, qp_embed_dim=8):
+    super().__init__()
+    self.conv = nn.Conv2d(image_channels + qp_embed_dim, 24, kernel_size=3, padding=1)
+    self.relu = nn.ReLU()
+
+  def forward(self, img_feat, qp_feat):
+    # print(img_feat.shape)
+    # print(qp_feat.shape)
+    fused = torch.cat([img_feat, qp_feat], dim=1)  # [B, 16+8, H, W]
+    return self.relu(self.conv(fused))
+
+class single_conv(nn.Module):
+  def __init__(self, ch_in, ch_out, kernel_size=3, stride2=1, padding2=1):
+    super(single_conv, self).__init__()
+    self.conv = nn.Sequential(
+      nn.Conv2d(ch_in, ch_out, kernel_size, stride=stride2, padding=padding2, bias=True),
+      nn.BatchNorm2d(ch_out),
+      nn.ReLU(inplace=True)
+    )
+
+  def forward(self, x):
+    x = self.conv(x)
+    return x
+
+class single_conv_dp(nn.Module):
+  def __init__(self, ch_in, ch_out, kernel_size, stride2, padding2):
+    super().__init__()
+    self.conv = nn.Sequential(
+      # Depthwise卷积
+      nn.Conv2d(ch_in, ch_in, kernel_size, stride2, padding2, groups=ch_in),
+      # 逐点卷积
+      nn.Conv2d(ch_in, ch_out, 1),
+      nn.BatchNorm2d(ch_out),
+      nn.ReLU()
+    )
+
+  def forward(self, x):
+    return self.conv(x)
+
+class subnet0(nn.Module):
+  def __init__(self, out_dim=6):
+    super(subnet0, self).__init__()
+    self.Conv1 = single_conv_dp(ch_in=24, ch_out=32, kernel_size=4, stride2=4, padding2=0)
+    self.Conv2 = single_conv_dp(ch_in=32, ch_out=64, kernel_size=4, stride2=4, padding2=0)
+    self.Conv3 = single_conv_dp(ch_in=64, ch_out=128, kernel_size=2, stride2=2, padding2=0)
+    self.fc1 = nn.Linear(128, 64)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(64, out_dim)
+    self.fusion = FusionBlock()
+    self.qpencoder = QPConditionalEncoder()
+    # self.atten_module_1 = nn.Parameter(torch.ones(4, 16))
+    # self.atten_module_2 = nn.Parameter(torch.ones(4, 128))
+
+  def forward(self, x, qp):
+    # if(qp==None):
+    #   qp = torch.tensor(0).expand(x.size(0))
+    # res = x.clone()
+    # atten_value_1 = self.atten_module_1[qp_list]
+    # res = res * (atten_value_1.view(atten_value_1.shape[0], atten_value_1.shape[1], 1, 1))
+    qp_feat = self.qpencoder(qp,(32,32))
+    res = self.fusion(x,qp_feat)
+
+    res = self.Conv1(res)
+    res = self.Conv2(res)
+    res = self.Conv3(res)
+    res = res.view(x.shape[0], 128)
+    # res2 = res.clone()
+    #
+    # atten_value_2 = self.atten_module_2[qp_list]
+    # res2 = res2 * atten_value_2
+    res2 = self.fc1(res)
+    res2 = self.relu(res2)
+    res2 = self.fc2(res2)
+    return res2
+
+class subnet5(nn.Module):
+  def __init__(self, out_dim=6):
+    super(subnet5, self).__init__()
+    self.Conv1 = single_conv_dp(ch_in=24, ch_out=32, kernel_size=4, stride2=4, padding2=0)
+    self.Conv2 = single_conv_dp(ch_in=32, ch_out=64, kernel_size=4, stride2=4, padding2=0)
+    self.Conv3 = single_conv_dp(ch_in=64, ch_out=128, kernel_size=2, stride2=2, padding2=0)
+    self.fc1 = nn.Linear(128, 64)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(64, out_dim)
+    self.fusion = FusionBlock()
+    self.qpencoder = QPConditionalEncoder()
+    # self.atten_module_1 = nn.Parameter(torch.ones(4, 16))
+    # self.atten_module_2 = nn.Parameter(torch.ones(4, 128))
+
+  def forward(self, x, qp):
+    # res = x.clone()
+    # atten_value_1 = self.atten_module_1[qp_list]
+    # res = res * (atten_value_1.view(atten_value_1.shape[0], atten_value_1.shape[1], 1, 1))
+    qp_feat = self.qpencoder(qp,(64,64))
+    res = self.fusion(x,qp_feat)
+
+    res = self.Conv1(res)
+    res = self.Conv2(res)
+    res = self.Conv3(res)
+    res = res.view(x.shape[0], 128)
+    # res2 = res.clone()
+    #
+    # atten_value_2 = self.atten_module_2[qp_list]
+    # res2 = res2 * atten_value_2
+    res2 = self.fc1(res)
+    res2 = self.relu(res2)
+    res2 = self.fc2(res2)
+    return res2
+
+
+class subnet1(nn.Module):
+  def __init__(self, out_dim=6):
+    super(subnet1, self).__init__()
+    self.Conv1 = single_conv_dp(ch_in=24, ch_out=32, kernel_size=(4,4), stride2=(4,4), padding2=0)
+    self.Conv2 = single_conv_dp(ch_in=32, ch_out=32, kernel_size=2, stride2=2, padding2=0)
+    self.Conv3 = single_conv_dp(ch_in=32, ch_out=64, kernel_size=2, stride2=2, padding2=0)
+    self.fc1 = nn.Linear(64, 64)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(64, out_dim)
+    self.fusion = FusionBlock()
+    self.qpencoder = QPConditionalEncoder()
+    # self.atten_module_1 = nn.Parameter(torch.ones(4, 16))
+    # self.atten_module_2 = nn.Parameter(torch.ones(4, 128))
+
+  def forward(self, x, qp):
+    # res = x.clone()
+    # atten_value_1 = self.atten_module_1[qp_list]
+    # res = res * (atten_value_1.view(atten_value_1.shape[0], atten_value_1.shape[1], 1, 1))
+    qp_feat = self.qpencoder(qp,(16,16))
+    res = self.fusion(x,qp_feat)
+
+    res = self.Conv1(res)
+    res = self.Conv2(res)
+    res = self.Conv3(res)
+    res = res.view(x.shape[0], 64)
+    # res2 = res.clone()
+    #
+    # atten_value_2 = self.atten_module_2[qp_list]
+    # res2 = res2 * atten_value_2
+    res2 = self.fc1(res)
+    res2 = self.relu(res2)
+    res2 = self.fc2(res2)
+    return res2
+
+class subnet2(nn.Module):
+  def __init__(self, out_dim=6):
+    super(subnet2, self).__init__()
+    self.Conv1 = single_conv_dp(ch_in=24, ch_out=32, kernel_size=(4,8), stride2=(4,8), padding2=0)
+    self.Conv2 = single_conv_dp(ch_in=32, ch_out=32, kernel_size=2, stride2=2, padding2=0)
+    self.Conv3 = single_conv_dp(ch_in=32, ch_out=64, kernel_size=2, stride2=2, padding2=0)
+    self.fc1 = nn.Linear(64, 64)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(64, out_dim)
+    self.fusion = FusionBlock()
+    self.qpencoder = QPConditionalEncoder()
+    # self.atten_module_1 = nn.Parameter(torch.ones(4, 16))
+    # self.atten_module_2 = nn.Parameter(torch.ones(4, 128))
+
+  def forward(self, x, qp):
+    # res = x.clone()
+    # atten_value_1 = self.atten_module_1[qp_list]
+    # res = res * (atten_value_1.view(atten_value_1.shape[0], atten_value_1.shape[1], 1, 1))
+    qp_feat = self.qpencoder(qp,(16,32))
+    res = self.fusion(x,qp_feat)
+
+    res = self.Conv1(res)
+    res = self.Conv2(res)
+    res = self.Conv3(res)
+    res = res.view(x.shape[0], 64)
+    # res2 = res.clone()
+    #
+    # atten_value_2 = self.atten_module_2[qp_list]
+    # res2 = res2 * atten_value_2
+    res2 = self.fc1(res)
+    res2 = self.relu(res2)
+    res2 = self.fc2(res2)
+    return res2
+
+class subnet3(nn.Module):
+  def __init__(self, out_dim=6):
+    super(subnet3, self).__init__()
+    self.Conv1 = single_conv_dp(ch_in=24, ch_out=32, kernel_size=(4,16), stride2=(4,16), padding2=0)
+    # self.Conv2 = single_conv(ch_in=32, ch_out=32, kernel_size=4, stride2=4, padding2=0)
+    self.Conv3 = single_conv_dp(ch_in=32, ch_out=64, kernel_size=2, stride2=2, padding2=0)
+    self.fc1 = nn.Linear(64, 64)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(64, out_dim)
+    self.fusion = FusionBlock()
+    self.qpencoder = QPConditionalEncoder()
+    # self.atten_module_1 = nn.Parameter(torch.ones(4, 16))
+    # self.atten_module_2 = nn.Parameter(torch.ones(4, 128))
+
+  def forward(self, x, qp):
+    # res = x.clone()
+    # atten_value_1 = self.atten_module_1[qp_list]
+    # res = res * (atten_value_1.view(atten_value_1.shape[0], atten_value_1.shape[1], 1, 1))
+    qp_feat = self.qpencoder(qp,(8,32))
+    res = self.fusion(x,qp_feat)
+
+    res = self.Conv1(res)
+    # res = self.Conv2(res)
+    res = self.Conv3(res)
+    res = res.view(x.shape[0], 64)
+    # res2 = res.clone()
+    #
+    # atten_value_2 = self.atten_module_2[qp_list]
+    # res2 = res2 * atten_value_2
+    res2 = self.fc1(res)
+    res2 = self.relu(res2)
+    res2 = self.fc2(res2)
+    return res2
+
+class subnet4(nn.Module):
+  def __init__(self, out_dim=6):
+    super(subnet4, self).__init__()
+    self.Conv1 = single_conv_dp(ch_in=24, ch_out=32, kernel_size=(4,8), stride2=(4,8), padding2=0)
+    # self.Conv2 = single_conv(ch_in=32, ch_out=32, kernel_size=4, stride2=4, padding2=0)
+    self.Conv3 = single_conv_dp(ch_in=32, ch_out=64, kernel_size=2, stride2=2, padding2=0)
+    self.fc1 = nn.Linear(64, 64)
+    self.relu = nn.ReLU()
+    self.fc2 = nn.Linear(64, out_dim)
+    self.fusion = FusionBlock()
+    self.qpencoder = QPConditionalEncoder()
+    # self.atten_module_1 = nn.Parameter(torch.ones(4, 16))
+    # self.atten_module_2 = nn.Parameter(torch.ones(4, 128))
+
+  def forward(self, x, qp):
+    # res = x.clone()
+    # atten_value_1 = self.atten_module_1[qp_list]
+    # res = res * (atten_value_1.view(atten_value_1.shape[0], atten_value_1.shape[1], 1, 1))
+    qp_feat = self.qpencoder(qp,(8,16))
+    res = self.fusion(x,qp_feat)
+
+    res = self.Conv1(res)
+    # res = self.Conv2(res)
+    res = self.Conv3(res)
+    res = res.view(x.shape[0], 64)
+    # res2 = res.clone()
+    #
+    # atten_value_2 = self.atten_module_2[qp_list]
+    # res2 = res2 * atten_value_2
+    res2 = self.fc1(res)
+    res2 = self.relu(res2)
+    res2 = self.fc2(res2)
+    return res2
+
+
+class AxialAttention(nn.Module):
+    """轴向注意力（水平与垂直方向分离计算）"""
+
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim // heads
+
+        # 水平方向注意力
+        self.to_qkv_h = nn.Conv2d(dim, dim * 3, 1, bias=False)
+        # 垂直方向注意力
+        self.to_qkv_v = nn.Conv2d(dim, dim * 3, 1, bias=False)
+
+        self.scale = self.dim_head ** -0.5
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        # 水平方向处理
+        qkv_h = self.to_qkv_h(x).chunk(3, dim=1)
+        q_h, k_h, v_h = map(
+            lambda t: t.permute(0, 2, 3, 1).reshape(b * h, w, self.heads, self.dim_head).permute(0, 2, 1, 3), qkv_h)
+        attn_h = (q_h @ k_h.transpose(-2, -1)) * self.scale
+        attn_h = attn_h.softmax(dim=-1)
+        out_h = (attn_h @ v_h).permute(0, 2, 1, 3).reshape(b, h, w, c).permute(0, 3, 1, 2)
+
+        # 垂直方向处理
+        qkv_v = self.to_qkv_v(x).chunk(3, dim=1)
+        q_v, k_v, v_v = map(
+            lambda t: t.permute(0, 3, 2, 1).reshape(b * w, h, self.heads, self.dim_head).permute(0, 2, 1, 3), qkv_v)
+        attn_v = (q_v @ k_v.transpose(-2, -1)) * self.scale
+        attn_v = attn_v.softmax(dim=-1)
+        out_v = (attn_v @ v_v).permute(0, 2, 1, 3).reshape(b, w, h, c).permute(0, 3, 2, 1)
+
+        return (out_h + out_v) * 0.5
+
+
+class AGFB(nn.Module):
+    """轴向门控融合块"""
+
+    def __init__(self, dim, heads=4, expansion=2):
+        super().__init__()
+
+        # 分支A：轴向注意力+通道注意力
+        self.branch_a = nn.Sequential(
+            AxialAttention(dim, heads),
+            nn.Conv2d(dim, dim // expansion, 1),
+            nn.GELU(),
+            SqueezeExcitation(dim // expansion),  # SE模块
+            nn.Conv2d(dim // expansion, dim, 1)
+        )
+
+        # 分支B：深度可分离卷积
+        self.branch_b = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),  # 深度卷积
+            nn.Conv2d(dim, dim * expansion, 1),  # 逐点卷积
+            nn.GELU(),
+            nn.Conv2d(dim * expansion, dim, 1)
+        )
+
+        # 动态门控融合
+        self.fusion_gate = nn.Sequential(
+            nn.Conv2d(dim * 2, dim // 2, 1),
+            nn.GELU(),
+            nn.Conv2d(dim // 2, 2, 1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        a = self.branch_a(x)
+        b = self.branch_b(x)
+
+        # 动态权重学习
+        gate = self.fusion_gate(torch.cat([a, b], dim=1))
+        w_a, w_b = gate.chunk(2, dim=1)
+
+        return x + a * w_a + b * w_b
+
+
+class SqueezeExcitation(nn.Module):
+    """通道注意力模块"""
+
+    def __init__(self, channel, reduction=4):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avgpool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class DepthDecoupledConv(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size):
+        super().__init__()
+        self.depth_conv = nn.Conv2d(in_ch, in_ch, kernel_size,
+                                    stride=1, padding=kernel_size // 2,
+                                    groups=in_ch)
+        self.point_conv = nn.Conv2d(in_ch, out_ch, 1)
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_ch, out_ch // 4, 1),
+            nn.ReLU(),
+            nn.Conv2d(out_ch // 4, out_ch, 1),
+            nn.Sigmoid())
+
+    def forward(self, x):
+        x = self.depth_conv(x)
+        x = self.point_conv(x)
+        att = self.channel_att(x)
+        return x * att
+
+
+class MGSTA(nn.Module):
+    def __init__(self, dim, qp_types):
+        super().__init__()
+        self.qp_embed = nn.Embedding(qp_types, dim)
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(dim, dim // 4, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(dim // 4, 1, 3, padding=1),
+            nn.Sigmoid())
+
+        self.temporal_att = nn.Sequential(  # 模拟相邻CU关系
+            nn.Conv1d(dim, dim // 2, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(dim // 2, dim, 3, padding=1),
+            nn.Sigmoid())
+
+    def forward(self, x, qp):
+        # 空间注意力
+        spatial = self.spatial_att(x)
+
+        # 伪时序注意力（模拟相邻块关系）
+        B, C, H, W = x.shape
+        temporal = x.view(B, C, -1).mean(-1)
+        temporal = self.temporal_att(temporal.unsqueeze(-1))
+
+        # QP条件调制
+        qp_emb = self.qp_embed(qp).view(B, C, 1, 1)
+        return x * spatial * temporal.view(B, C, 1, 1) * qp_emb
+
+
+class DynamicReorgNet(nn.Module):
+    def __init__(self, in_dim, out_dim, qp_types):
+        super().__init__()
+        self.stage1 = nn.Sequential(
+            DepthDecoupledConv(in_dim, 32, 3),
+            nn.GELU(),
+            DepthDecoupledConv(32, 64, 3))
+
+        self.mgsta = MGSTA(64, qp_types)
+
+        self.stage2 = nn.Sequential(
+            nn.AdaptiveMaxPool2d(4),
+            DepthDecoupledConv(64, 128, 1),
+            nn.GELU())
+
+        self.final = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 256),
+            nn.Dropout(0.2),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, out_dim))
+
+    def forward(self, x, qp):
+        x = self.stage1(x)
+        x = self.mgsta(x, qp)
+        x = self.stage2(x)
+        x = x.flatten(1)
+        return self.final(x)
+
+
+class HeterogeneousBranch(nn.Module):
+    def __init__(self, in_dim, out_dim, qp_types):
+        super().__init__()
+        # 主分支：高频特征提取
+        self.main_branch = nn.Sequential(
+            DepthDecoupledConv(in_dim, 32, 5),
+            nn.GELU(),
+            DepthDecoupledConv(32, 64, 3))
+
+        # 辅助分支：低频特征提取
+        self.aux_branch = nn.Sequential(
+            nn.AvgPool2d(3, stride=2, padding=1),
+            DepthDecoupledConv(in_dim, 32, 3),
+            nn.GELU())
+
+        # 特征重组模块
+        # self.fusion = nn.Sequential(
+        #     DepthDecoupledConv(96, 128, 1),
+        #     MGSTA(128, qp_types))
+        self.conv = DepthDecoupledConv(96, 128, 1)
+        self.fusion = MGSTA(128, qp_types)
+        # self.fusion = MGSTA(16, qp_types)
+        # 动态预测头
+        self.head = DynamicReorgNet(128, out_dim, qp_types)
+
+    def forward(self, x, qp):
+        # if qp == None:
+        #   qp = torch.ones(x.shape[0], dtype=int)*0
+        main = self.main_branch(x)
+        aux = F.interpolate(self.aux_branch(x), size=main.shape[2:])
+        aux = self.conv(torch.cat([main, aux], 1))
+        fused = self.fusion(aux, qp)
+        # fused = self.fusion(x, qp)
+        # fused = self.fusion(torch.cat([main, aux], 1),qp)
+        return self.head(fused, qp)
+
+
+
+class OptimizedHeterogeneousBranch(nn.Module):
+    def __init__(self, in_dim, out_dim, qp_types, expansion_ratio=0.5):
+      super().__init__()
+      compressed_dim = int(in_dim * expansion_ratio)
+
+      # 共享基础卷积
+      self.base_conv = nn.Sequential(
+        nn.Conv2d(in_dim, compressed_dim, 3, padding=1),
+        nn.GELU()
+      )
+
+      # 轻量化主分支（高频特征）
+      self.main_branch = nn.Sequential(
+        DepthDecoupledConv(compressed_dim, compressed_dim, 5),
+        nn.GELU(),
+        nn.Conv2d(compressed_dim, compressed_dim, 1)  # 通道重校准
+      )
+
+      # 超轻量辅助分支（低频特征）
+      self.aux_branch = nn.Sequential(
+        nn.AvgPool2d(3, stride=2, padding=1),
+        nn.Conv2d(compressed_dim, compressed_dim , 1),
+        nn.GELU()
+      )
+
+      # 高效特征融合（与AGFB协同设计）
+      self.fusion = nn.Sequential(
+        nn.Conv2d(compressed_dim *  2, compressed_dim, 1),
+        AGFB(compressed_dim, heads=2)  # 复用AGFB模块
+      )
+
+      # 轻量化预测头
+      self.head = nn.Sequential(
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+        nn.Linear(compressed_dim, 128),
+        nn.LayerNorm(128),
+        nn.Linear(128, out_dim)
+      )
+
+      # 动态QP调制
+      self.qp_modulation = nn.Sequential(
+        nn.Embedding(qp_types, compressed_dim),
+        nn.Linear(compressed_dim, compressed_dim * 2),
+        nn.GELU()
+      )
+
+    def forward(self, x, qp=None):
+      if qp == None:
+        qp = torch.ones(x.shape[0], dtype=int) * 0
+      # 基础特征提取
+      x = self.base_conv(x)
+
+      # 分支处理
+      main = self.main_branch(x)
+      aux = F.interpolate(self.aux_branch(x), size=x.shape[2:])
+
+      # QP调制
+      qp_weights = self.qp_modulation(qp).unsqueeze(-1).unsqueeze(-1)
+      scale, shift = qp_weights.chunk(2, dim=1)
+
+      # 动态特征融合
+      fused = self.fusion(torch.cat([
+        main * (1 + scale),
+        aux * (1 - scale)
+      ], dim=1))
+
+      # 残差连接
+      fused += x  # 利用基础特征
+
+      return self.head(fused)
+
+
+class OptimizedHeterogeneousBranchv2(nn.Module):
+  def __init__(self, in_dim, out_dim, qp_types):
+    super().__init__()
+
+    # 增强特征整合
+    self.feat_integration = nn.Sequential(
+      AGFB(in_dim),  # 前置AGFB已包含多分支融合
+      nn.Conv2d(in_dim, 64, 3, padding=1),
+      nn.GELU()
+    )
+
+    # 多粒度特征提取
+    self.multi_scale = nn.ModuleDict({
+      'high': nn.Sequential(
+        nn.Conv2d(64, 64, 3, padding=1, groups=64),  # 深度卷积保持高频
+        nn.GELU()),
+      'low': nn.Sequential(
+        nn.AvgPool2d(3, stride=2, padding=1),
+        nn.Conv2d(64, 64, 3, padding=1),
+        nn.Upsample(scale_factor=2, mode='bilinear'))
+    })
+
+    # 轻量级时空注意力
+    self.fusion_att1 = nn.Conv2d(128, 64, 1)
+    self.MGSTA = MGSTA(64, qp_types)
+    self.fusion_att2 = nn.Conv2d(64, 128, 3, padding=1)
+
+    # 动态预测头
+    self.head = nn.Sequential(
+      nn.AdaptiveAvgPool2d(4),
+      nn.Flatten(),
+      nn.Linear(128 * 16, 256),
+      nn.LayerNorm(256),
+      nn.GELU(),
+      nn.Linear(256, out_dim)
+    )
+
+  def forward(self, x, qp=None):
+    if qp == None:
+      qp = torch.ones(x.shape[0], dtype=int) * 0
+    # 特征整合
+    x = self.feat_integration(x)
+
+    # 并行多尺度处理
+    high = self.multi_scale['high'](x)
+    low = self.multi_scale['low'](x)
+
+    # 注意力融合
+    fused = torch.cat([high, low], dim=1)
+    fused = self.fusion_att1(fused)
+    fused = self.MGSTA(fused,qp)
+    fused = self.fusion_att2(fused)
+
+    # 动态预测
+    return self.head(fused)
+
+# class DynamicRoutingGate(nn.Module):
+#   def __init__(self, in_dim, num_experts):
+#     super().__init__()
+#     self.gating_net = nn.Sequential(
+#       nn.Linear(in_dim, 32),
+#       nn.ReLU(),
+#       nn.Linear(32, num_experts),
+#       nn.Softmax(dim=-1))
+#
+#   def forward(self, x, qp_emb):
+#     combined = torch.cat([x.mean(dim=(2, 3)), qp_emb], dim=1)
+#     return self.gating_net(combined)
+#
+#
+# class DSC_Block(nn.Module):
+#   def __init__(self, ch_dim, spatial_dim):
+#     super().__init__()
+#     # 空间动态卷积
+#     self.spatial_conv = nn.Conv2d(ch_dim, ch_dim, 3,
+#                                   padding=1, groups=ch_dim)
+#     # 新增自适应下采样层
+#     self.downsample = nn.AdaptiveMaxPool2d((spatial_dim[0] // 2, spatial_dim[1] // 2))
+#     # 确保输出尺寸一致
+#     self.output_size = (spatial_dim[0] // 2, spatial_dim[1] // 2)
+#     # 通道交互模块
+#     self.channel_mixer = nn.Sequential(
+#       nn.AdaptiveAvgPool2d(1),
+#       nn.Conv2d(ch_dim, ch_dim // 4, 1),
+#       nn.ReLU(),
+#       nn.Conv2d(ch_dim // 4, ch_dim, 1),
+#       nn.Sigmoid())
+#
+#     # 动态尺度适配
+#     if min(spatial_dim) <= 8:
+#       self.resolution_keeper = nn.Identity()
+#     else:
+#       self.resolution_keeper = nn.MaxPool2d(2)
+#
+#   def forward(self, x):
+#     # 空间动态卷积
+#     spatial = self.spatial_conv(x)
+#     # 通道注意力
+#     channel = self.channel_mixer(x)
+#     # 动态融合
+#     out = spatial * channel + x
+#     return self.resolution_keeper(out)
+#
+#
+# class DSC_Net(nn.Module):
+#   def __init__(self, out_dim, spatial_size, qp_size):
+#     super().__init__()
+#     self.qp_embed = nn.Embedding(qp_size, 16)
+#
+#     # 构建动态路由块
+#     self.blocks = nn.ModuleList([
+#       DSC_Block(16, spatial_size),
+#       DSC_Block(16, (spatial_size[0] // 2, spatial_size[1] // 2)),
+#       DSC_Block(16, (spatial_size[0] // 4, spatial_size[1] // 4))
+#     ])
+#
+#     # 动态路由门
+#     self.router = DynamicRoutingGate(32, len(self.blocks))
+#
+#     # 自适应输出模块
+#     self.adaptive_pool = nn.AdaptiveAvgPool2d(4)
+#     self.final_mixer = nn.Sequential(
+#       nn.Linear(16 * 16, 64),
+#       nn.GELU(),
+#       nn.Dropout(0.2),
+#       nn.Linear(64, out_dim))
+#
+#   def forward(self, x, qp_list):
+#     # print(x.shape)
+#     qp_emb = self.qp_embed(qp_list)
+#
+#     # 动态路由
+#     route_weights = self.router(x, qp_emb)
+#
+#     # 多路径处理
+#     feature_maps = []
+#     residual = x
+#     for i, block in enumerate(self.blocks):
+#       residual = block(residual)
+#       weight_mask = route_weights[:, i].view(-1, 1, 1, 1)
+#       # print(residual.shape)
+#       # print(route_weights[:, i].unsqueeze(-1).unsqueeze(-1).shape)
+#       # print(weight_mask.shape)
+#       # weighted = residual * route_weights[:, i].unsqueeze(-1).unsqueeze(-1)
+#       weighted = residual * weight_mask
+#       feature_maps.append(weighted)
+#
+#     # 特征融合
+#     # print(feature_maps[0].shape)
+#     # print(feature_maps[1].shape)
+#     # print(feature_maps[2].shape)
+#     fused = sum(feature_maps)
+#
+#     # 分辨率适配
+#     pooled = self.adaptive_pool(fused)
+#
+#     # QP信息融合
+#     qp_effect = qp_emb.unsqueeze(-1).unsqueeze(-1)
+#     enhanced = pooled * (1 + qp_effect)
+#
+#     # 最终预测
+#     flattened = enhanced.view(x.size(0), -1)
+#     return self.final_mixer(flattened)
+
+class DynamicRoutingGate(nn.Module):
+    def __init__(self, in_dim, num_experts):
+      super().__init__()
+      self.gating_net = nn.Sequential(
+        nn.Linear(in_dim, 128),
+        nn.GELU(),
+        nn.Linear(128, num_experts),
+        # nn.Softmax(dim=1)
+      )
+
+    def forward(self, x_feat, qp_emb):
+      combined = torch.cat([x_feat.mean(dim=(2, 3)), qp_emb], dim=1)
+      return self.gating_net(combined)
+
+
+class DSC_Block(nn.Module):
+  def __init__(self, in_channels, target_size):
+    super().__init__()
+    self.channel_mixer = nn.Sequential(
+      nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels),
+      nn.GELU(),
+      nn.Conv2d(in_channels, in_channels, 1),
+      nn.InstanceNorm2d(in_channels)
+    )
+    self.attention = nn.Sequential(
+      nn.AdaptiveAvgPool2d(1),
+      nn.Conv2d(in_channels, in_channels // 4, 1),
+      nn.ReLU(),
+      nn.Conv2d(in_channels // 4, in_channels, 1),
+      nn.Sigmoid()
+    )
+    self.size_adapter = nn.AdaptiveAvgPool2d(target_size) if target_size else None
+
+  def forward(self, x):
+    identity = x
+    x = self.channel_mixer(x) * self.attention(x)
+    # x = self.channel_mixer(x)
+    if self.size_adapter:
+      x = self.size_adapter(x + identity)
+    return x
+
+
+class FeatureFuser(nn.Module):
+  def __init__(self, target_size):
+    super().__init__()
+    self.target_size = target_size
+    self.pool = nn.AdaptiveAvgPool2d(target_size)
+    self.upsample = nn.Upsample(size=target_size, mode='bilinear', align_corners=True)
+
+  def forward(self, features):
+    aligned = []
+    for feat in features:
+      if feat.shape[-2:] > self.target_size:
+        aligned.append(self.pool(feat))
+      elif feat.shape[-2:] < self.target_size:
+        aligned.append(self.upsample(feat))
+      else:
+        aligned.append(feat)
+    return torch.stack(aligned).mean(dim=0)
+
+
+class DSC_Net(nn.Module):
+  def __init__(self, out_dim, spatial_size, qp_size):
+    super().__init__()
+    # 输入统一适配
+    self.input_adapter = nn.Conv2d(16, 64, 3, padding=1)
+
+    # QP嵌入层
+    self.qp_embed = nn.Embedding(qp_size, 64)
+
+    # 动态路由
+    self.router = DynamicRoutingGate(in_dim=128, num_experts=1)
+
+    # 特征处理块
+    base_size = (spatial_size[0] // 4, spatial_size[1] // 4)
+    # base_size = (spatial_size[0], spatial_size[1]) #ttttttest
+    self.blocks = nn.ModuleList([
+      # DSC_Block(64, target_size=base_size),
+      # DSC_Block(64, target_size=base_size),
+      DSC_Block(64, target_size=base_size)
+    ])
+
+    # 特征融合
+    self.fuser = FeatureFuser(target_size=base_size)
+
+    # 输出层
+    self.final = nn.Sequential(
+      nn.Conv2d(64, 32, 1),
+      nn.ReLU(),
+      nn.Flatten(),
+      nn.Linear(32 * base_size[0] * base_size[1], 128),
+      nn.Dropout(0.2),
+      nn.Linear(128, out_dim)
+    )
+
+  def forward(self, x, qp_list=None):
+    if qp_list == None:
+      qp_list = torch.ones(x.shape[0], dtype=int) * 0
+    # 输入处理
+    x = self.input_adapter(x)
+    B, C, H, W = x.shape
+
+    # QP信息融合
+    qp_emb = self.qp_embed(qp_list)
+
+    # 路由权重生成
+    route_weights = self.router(x, qp_emb)  # [B, 3]
+
+    # 多路径处理
+    feature_maps = []
+    for i, block in enumerate(self.blocks):
+      weighted_x = x * route_weights[:, i].view(B, 1, 1, 1)
+      processed = block(weighted_x)
+      feature_maps.append(processed)
+
+    # 特征融合
+    fused = self.fuser(feature_maps)
+
+    # 最终输出
+    return self.final(fused)
+
+class ChannelAdaptiveAttention(nn.Module):
+
+
+  def __init__(self, channel, reduction_ratio=8):
+    super().__init__()
+    self.channel = channel
+    self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+    self.conv = nn.Sequential(
+      nn.Conv2d(channel, channel // reduction_ratio, 1, bias=False),
+      nn.ReLU(inplace=True),
+      nn.Conv2d(channel // reduction_ratio, channel, 1, bias=False),
+      nn.Sigmoid()
+    )
+
+    self.spatial_att = nn.Sequential(
+      nn.Conv2d(channel, 1, 3, padding=1, bias=False),
+      nn.Sigmoid()
+    )
+
+  def forward(self, x):
+    channel_att = self.conv(self.avg_pool(x))
+    spatial_att = self.spatial_att(x)
+    return x * channel_att * spatial_att
+
+
+class MultiScaleDepthwiseConv(nn.Module):
+  """多尺度深度可分离卷积"""
+
+  def __init__(self, in_channels, out_channels):
+    super().__init__()
+    self.dw_conv3 = nn.Sequential(
+      nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
+      nn.BatchNorm2d(in_channels),
+      nn.ReLU(inplace=True)
+    )
+    self.dw_conv5 = nn.Sequential(
+      nn.Conv2d(in_channels, in_channels, 5, padding=2, groups=in_channels, bias=False),
+      nn.BatchNorm2d(in_channels),
+      nn.ReLU(inplace=True)
+    )
+    self.pw_conv = nn.Conv2d(in_channels * 2, out_channels, 1, bias=False)
+
+  def forward(self, x):
+    x1 = self.dw_conv3(x)
+    x2 = self.dw_conv5(x)
+    return self.pw_conv(torch.cat([x1, x2], dim=1))
+
+
+class AdaptiveFeatureFusion(nn.Module):
+  """自适应特征融合模块"""
+
+  def __init__(self, dim):
+    super().__init__()
+    self.local_conv = nn.Sequential(
+      MultiScaleDepthwiseConv(dim, dim),
+      nn.BatchNorm2d(dim),
+      nn.ReLU(inplace=True)
+    )
+    self.global_att = ChannelAdaptiveAttention(dim)
+    self.fuse_conv = nn.Conv2d(dim * 2, dim, 3, padding=1)
+
+  def forward(self, x):
+    local_feat = self.local_conv(x)
+    global_feat = self.global_att(x)
+    fused = torch.cat([local_feat, global_feat], dim=1)
+    return self.fuse_conv(fused)
+
+
+class EnhancedFeatureExtractor(nn.Module):
+  """增强型特征提取网络"""
+
+  def __init__(self, dim=192, expansion_ratio=4):
+    super().__init__()
+    hidden_dim = dim * expansion_ratio
+
+    self.net = nn.Sequential(
+      # 特征重组层
+      nn.Conv2d(dim, hidden_dim, 1),
+      nn.BatchNorm2d(hidden_dim),
+      nn.ReLU(inplace=True),
+
+      # 多尺度特征提取
+      AdaptiveFeatureFusion(hidden_dim),
+
+      # 通道压缩
+      nn.Conv2d(hidden_dim, dim, 1),
+      nn.BatchNorm2d(dim)
+    )
+
+    self.att_gate = nn.Sequential(
+      nn.Conv2d(dim, 1, 3, padding=1),
+      nn.Sigmoid()
+    )
+
+  def forward(self, x):
+    identity = x
+    residual = self.net(x)
+
+    # 自适应门控机制
+    gate = self.att_gate(x)
+    out = identity + residual * gate
+    # out = identity + residual
+
+    return out
