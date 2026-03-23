@@ -1,6 +1,33 @@
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+try:
+    from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+except ImportError:
+    from collections.abc import Iterable
+
+    def to_2tuple(value):
+        if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+            value = tuple(value)
+            if len(value) == 2:
+                return value
+        return (value, value)
+
+    def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
+        return nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+
+    class DropPath(nn.Module):
+        def __init__(self, drop_prob=0.0):
+            super().__init__()
+            self.drop_prob = drop_prob
+
+        def forward(self, x):
+            if self.drop_prob == 0.0 or not self.training:
+                return x
+            keep_prob = 1.0 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+            random_tensor.floor_()
+            return x.div(keep_prob) * random_tensor
 
 def conv3x3(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
     """3x3 convolution with padding."""

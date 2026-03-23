@@ -51,6 +51,7 @@
 #include <deque>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 
 #include "CommonLib/UnitTools.h"
 #include "CommonLib/dtrace_codingstruct.h"
@@ -1980,16 +1981,26 @@ void EncGOP::compressGOP( EncCu* m_cCuEncoder,int iPOCLast, int iNumPicRcvd, Pic
     m_cCuEncoder->my_POC=-1;
   }
   m_cCuEncoder->init_flag=1;
+  m_cCuEncoder->fastPartitionEnabled = true;
 
   string name;
   name=m_pcEncLib->EncLib_inputYUVname;
-  //printf("%s\n", name);
-  //printf("%s",name.c_str());
-  printf("%s\n", name.substr(name.rfind("/")).c_str());
-  //name=name.substr(name.rfind("/"));
-  //printf("%s\n", name);
-  //name = "RaceHorses_416x240_30.yuv";
-  name = "BasketballPass_416x240_50.yuv";
+  size_t name_pos = name.find_last_of("/\\");
+  if(name_pos != string::npos){
+    name = name.substr(name_pos + 1);
+  }
+  printf("%s\n", name.c_str());
+
+  string predDir = "H:/wwy/inter_fast/STRANet-master/gen_file/C2";
+  if(const char* predDirEnv = std::getenv("STRANET_PRED_DIR")){
+    if(predDirEnv[0] != '\0'){
+      predDir = predDirEnv;
+    }
+  }
+  bool disableFastPartition = false;
+  if(const char* disableEnv = std::getenv("STRANET_DISABLE_FASTPARTITION")){
+    disableFastPartition = string(disableEnv) == "1";
+  }
   int qp;
   qp=(m_cCuEncoder->m_pcEncCfg->getBaseQP()-22)/5;
 
@@ -1998,40 +2009,45 @@ void EncGOP::compressGOP( EncCu* m_cCuEncoder,int iPOCLast, int iNumPicRcvd, Pic
     (m_cCuEncoder->my_POC)+=1;
     memset(m_cCuEncoder->fastpartition,0,sizeof(m_cCuEncoder->fastpartition));
     memset(m_cCuEncoder->chromapartition,0,sizeof(m_cCuEncoder->chromapartition));
-    //ifs.open("your_path"+name+"/"+std::to_string(qp)+"_"+std::to_string(m_cCuEncoder->my_POC)+".txt");
-    ifstream ifs;
-    /*ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/"+name+"/"+std::to_string(qp)+"_"+std::to_string(m_cCuEncoder->my_POC)+".txt");*/
-    //ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/"+name+"/"+std::to_string(qp)+"_"+std::to_string(m_cCuEncoder->my_POC)+".txt");
-    /*ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/"+name+"/"+std::to_string(qp)+".txt");*/
-    ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/"+name+"/"+std::to_string(qp)+".txt");
-    int posh,posw,cuh,cuw,mode,frame_num;
-    while(ifs>>frame_num>>posh>>posw>>cuh>>cuw>>mode){
-      if(posh==-1)break;
-      if(frame_num!=(m_cCuEncoder->my_POC)){
-        int a;
-        for(int i=0;i<6;i++)ifs>>a;
-        continue;
-      }
-      if(cuh==0){
-        for(int i=0;i<4;i++){
-          ifs>>m_cCuEncoder->chromapartition[posh/64][posw/64][i];
-          m_cCuEncoder->chromapartition[posh/64][posw/64][i]-=48;
-        }
-        ifs>>cuh>>cuw;
-        m_cCuEncoder->chromapartition[posh/64][posw/64][4]=1;
+    if(!disableFastPartition){
+      string predFile = predDir + "/" + name + "/" + std::to_string(qp) + ".txt";
+      ifstream ifs(predFile);
+      if(!ifs.is_open()){
+        printf("Fast partition file not found: %s\n", predFile.c_str());
+        m_cCuEncoder->fastPartitionEnabled = false;
       }
       else{
-        uint8_t pred = 0;
-        uint8_t tmp_pred = 0;
-        for(int i=0;i<6;i++){
-          ifs >> tmp_pred;
-          pred += ((tmp_pred-48) << i);
+        int posh,posw,cuh,cuw,mode,frame_num;
+        while(ifs>>frame_num>>posh>>posw>>cuh>>cuw>>mode){
+          if(posh==-1)break;
+          if(frame_num!=(m_cCuEncoder->my_POC)){
+            int a;
+            for(int i=0;i<6;i++)ifs>>a;
+            continue;
+          }
+          if(cuh==0){
+            for(int i=0;i<4;i++){
+              ifs>>m_cCuEncoder->chromapartition[posh/64][posw/64][i];
+              m_cCuEncoder->chromapartition[posh/64][posw/64][i]-=48;
+            }
+            ifs>>cuh>>cuw;
+            m_cCuEncoder->chromapartition[posh/64][posw/64][4]=1;
+          }
+          else{
+            uint8_t pred = 0;
+            uint8_t tmp_pred = 0;
+            for(int i=0;i<6;i++){
+              ifs >> tmp_pred;
+              pred += ((tmp_pred-48) << i);
+            }
+            m_cCuEncoder->fastpartition[posh/4][posw/4][cuh/4][cuw/4][mode] = pred;
+          }
         }
-        m_cCuEncoder->fastpartition[posh/4][posw/4][cuh/4][cuw/4][mode] = pred;
-        //m_cCuEncoder->fastpartition[frame_num][posh/4][posw/4][cuh/4][cuw/4][mode][6]=1;
       }
     }
-    ifs.close();
+    else{
+      m_cCuEncoder->fastPartitionEnabled = false;
+    }
 
     // reset flag indicating whether pictures have been encoded
     m_pcCfg->setEncodedFlag( iGOPid, false );

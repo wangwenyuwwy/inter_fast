@@ -602,7 +602,7 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
   int cansplit_mode=0;
   int last_split=(int)(partitioner.m_partStack.back().split);
 
-  if(compBegin == COMPONENT_Y && (int)tempCS->area.lheight()<=32 && (int)tempCS->area.lwidth()<=32 && 
+  if(fastPartitionEnabled && compBegin == COMPONENT_Y && (int)tempCS->area.lheight()<=32 && (int)tempCS->area.lwidth()<=32 && 
     partitioner.currMtDepth < tempCS->pcv->getMaxBtDepth( *tempCS->slice, partitioner.chType ) + partitioner.currImplicitBtDepth &&
     (int)tempCS->area.lheight()>=8 && (int)tempCS->area.lwidth()>=8){
     if ((int)tempCS->area.lheight()==16 && (int)tempCS->area.lwidth()==16){
@@ -737,7 +737,7 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     if(temp==-1 || temp==7)temp=0;
     ComprCUCtx& cuECtx=m_modeCtrl->m_ComprCUCtxList.back();
 
-    if( temp!=0 && !has_restrict && temp<=5 && temp>=0 && ((compBegin==COMPONENT_Y &&
+    if( fastPartitionEnabled && temp!=0 && !has_restrict && temp<=5 && temp>=0 && ((compBegin==COMPONENT_Y &&
         (fastpartition[uiTPelY/4][uiLPelX/4][(int)tempCS->area.lheight()/4][(int)tempCS->area.lwidth()/4][cansplit_mode]>>temp & 1)==0) /*||
         (compBegin!=COMPONENT_Y && chromapartition[uiTPelY/64][uiLPelX/64][temp]==0)*/)){
       if(temp==1)cuECtx.set(2,false);

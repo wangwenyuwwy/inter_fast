@@ -6,7 +6,8 @@ import gc
 import json
 from statistics import mean
 import argparse
-device = torch.device('cuda:0')
+import re
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 batch_size_0=512
 batch_size_1=512
 batch_size_2=512
@@ -19,12 +20,15 @@ from myModel import AGFB,HeterogeneousBranch,DSC_Net,EnhancedFeatureExtractor
 
 
 def main(file_name, model_path, is_Window, tot_frm,speed_choice,thres):
-    if not os.path.exists("./"+speed_choice):
-        os.mkdir("./"+speed_choice)
-    if not os.path.exists("./"+speed_choice+file_name.split("/")[-1]):
-        os.mkdir("./"+speed_choice+file_name.split("/")[-1])
-    img_h=int(file_name.split("_")[2].split("x")[1])
-    img_w=int(file_name.split("_")[2].split("x")[0])
+    output_root = speed_choice if os.path.isabs(speed_choice) else os.path.join(os.getcwd(), speed_choice)
+    video_name = os.path.basename(file_name)
+    video_output_dir = os.path.join(output_root, video_name)
+    os.makedirs(video_output_dir, exist_ok=True)
+    match = re.search(r'(\d+)x(\d+)', video_name)
+    if not match:
+        raise ValueError("Cannot parse width/height from file name: {}".format(video_name))
+    img_w = int(match.group(1))
+    img_h = int(match.group(2))
     
     model_time=[]
     time_6464 = 0.0
@@ -155,7 +159,7 @@ def main(file_name, model_path, is_Window, tot_frm,speed_choice,thres):
           # if cuSize == 0 or cuSize == 2 :
           # if cuSize < 5 :
             for i,module in enumerate(cuSize_list[cuSize]):
-              module.load_state_dict(torch.load(os.path.join(model_path+str(cuSize)+'/module-%d.pkl' % (i))), strict=True)
+              module.load_state_dict(torch.load(os.path.join(model_path+str(cuSize)+'/module-%d.pkl' % (i)), map_location=device), strict=True)
               module.to(device)
               module.train(False)
               module.eval()
@@ -545,7 +549,7 @@ def main(file_name, model_path, is_Window, tot_frm,speed_choice,thres):
         torch.cuda.empty_cache()
 
         #write to txt file
-        with open("./"+speed_choice+file_name.split("/")[-1]+"/"+str(qp)+'.txt','w') as file:
+        with open(os.path.join(video_output_dir, str(qp)+'.txt'),'w') as file:
             for key,v in cus.items():
                 file.write(str(key[0])+" "+str(key[1])+" "+str(key[2])+" "+str(key[3])+" "+str(key[4])+" "+str(key[5]))
                 for split in range(6):
@@ -579,7 +583,21 @@ if __name__ == '__main__':
     parser.add_argument('--seq_path_A2', type=str, default="F:/FJR/DataSET/HEVC_Test_Sequence/ClassA2/")
     parser.add_argument('--is_Window', type=int, default=1)
     parser.add_argument('--tot_frm', type=int, default=32)
+    parser.add_argument('--video_name', type=str, default='')
+    parser.add_argument('--output_dir', type=str, default='')
+    parser.add_argument('--threshold', type=float, default=0.125)
     config = parser.parse_args()
+    if config.video_name:
+        output_dir = config.output_dir or os.path.join(os.getcwd(), 'regen_txt')
+        seq_root = config.seq_path if config.seq_path.endswith(('/', '\\')) else config.seq_path + os.sep
+        video_path = seq_root + config.video_name
+        threshold = [config.threshold] * 6
+        print(video_path, 'start')
+        start = time.time()
+        main(video_path, config.model_path, config.is_Window, config.tot_frm, output_dir, threshold)
+        print(time.time() - start)
+        raise SystemExit(0)
+
     ali = [
       # "908_1920x1080_00.yuv",
       "wzry1_1920x1080_00.yuv",
