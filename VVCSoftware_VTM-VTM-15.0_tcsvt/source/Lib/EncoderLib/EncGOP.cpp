@@ -2252,7 +2252,7 @@ void EncGOP::compressGOP(EncCu *m_cCuEncoder, int iPOCLast, int iNumPicRcvd, Pic
     // ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/"+name+"/"+std::to_string(qp)+"_"+std::to_string(m_cCuEncoder->my_POC)+".txt");
     /*ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/"+name+"/"+std::to_string(qp)+".txt");*/
     /*ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/lll"+std::to_string(qp*5+22)+"/" + name + "/" + std::to_string(qp) + ".txt");*/
-    ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/final_0075/" + name + "/"
+    ifs.open("H:/wwy/inter_fast/STRANet-master/gen_file/final_0175/" + name + "/"
              + std::to_string(qp) + ".txt");
     //ifs.open("G:/bxl/STRANet-master/STRANet-master/gen_file/C2/" + name + "/" + std::to_string(qp) + ".txt");
     int posh, posw, cuh, cuw, mode, frame_num;
