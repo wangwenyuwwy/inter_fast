@@ -358,7 +358,7 @@ class ECALayer(nn.Module):
 class GhostECABlock(nn.Module):
   def __init__(self, in_chs=16, out_chs=16, exp_size=8, kernel_size=3, stride=1, reduction=4):
     super().__init__()
-    # Ghost Block原始结构
+    # Ghost Block鍘熷缁撴瀯
     self.primary_conv = nn.Sequential(
       nn.Conv2d(in_chs, exp_size, kernel_size, stride, kernel_size // 2, bias=False),
       nn.BatchNorm2d(exp_size),
@@ -369,16 +369,16 @@ class GhostECABlock(nn.Module):
       nn.BatchNorm2d(exp_size),
       nn.ReLU(inplace=True)
     )
-    # 合并特征图后的ECA
+    # 鍚堝苟鐗瑰緛鍥惧悗鐨凟CA
     self.combine = nn.Conv2d(exp_size * 2, out_chs, 1, 1, 0, bias=False)
-    self.eca = ECALayer(out_chs)  # 需提前定义ECA模块
+    self.eca = ECALayer(out_chs)  # 闇€鎻愬墠瀹氫箟ECA妯″潡
 
   def forward(self, x):
     x1 = self.primary_conv(x)
     x2 = self.cheap_conv(x1)
     out = torch.cat([x1, x2], dim=1)
     out = self.combine(out)
-    out = self.eca(out)  # 在合并后应用ECA
+    out = self.eca(out)  # 鍦ㄥ悎骞跺悗搴旂敤ECA
     return out
 
 
@@ -400,7 +400,7 @@ class QPConditionalEncoder(nn.Module):
     super().__init__()
     self.embed = nn.Embedding(num_embeddings=4, embedding_dim=qp_embed_dim)
 
-    # 自适应缩放 (与图像通道数关联)
+    # 鑷€傚簲缂╂斁 (涓庡浘鍍忛€氶亾鏁板叧鑱?
     self.scale = nn.Parameter(torch.ones(qp_embed_dim) * 0.5)
     self.bias = nn.Parameter(torch.zeros(qp_embed_dim))
 
@@ -410,8 +410,7 @@ class QPConditionalEncoder(nn.Module):
     return x.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, *spatial_shape)
 
 
-# 特征融合层（关键设计）
-class FusionBlock(nn.Module):
+# 鐗瑰緛铻嶅悎灞傦紙鍏抽敭璁捐锛?class FusionBlock(nn.Module):
   def __init__(self, image_channels=16, qp_embed_dim=8):
     super().__init__()
     self.conv = nn.Conv2d(image_channels + qp_embed_dim, 24, kernel_size=3, padding=1)
@@ -440,9 +439,9 @@ class single_conv_dp(nn.Module):
   def __init__(self, ch_in, ch_out, kernel_size, stride2, padding2):
     super().__init__()
     self.conv = nn.Sequential(
-      # Depthwise卷积
+      # Depthwise鍗风Н
       nn.Conv2d(ch_in, ch_in, kernel_size, stride2, padding2, groups=ch_in),
-      # 逐点卷积
+      # 閫愮偣鍗风Н
       nn.Conv2d(ch_in, ch_out, 1),
       nn.BatchNorm2d(ch_out),
       nn.ReLU()
@@ -660,24 +659,22 @@ class subnet4(nn.Module):
 
 
 class AxialAttention(nn.Module):
-    """轴向注意力（水平与垂直方向分离计算）"""
+    """杞村悜娉ㄦ剰鍔涳紙姘村钩涓庡瀭鐩存柟鍚戝垎绂昏绠楋級"""
 
     def __init__(self, dim, heads=4):
         super().__init__()
         self.heads = heads
         self.dim_head = dim // heads
 
-        # 水平方向注意力
-        self.to_qkv_h = nn.Conv2d(dim, dim * 3, 1, bias=False)
-        # 垂直方向注意力
-        self.to_qkv_v = nn.Conv2d(dim, dim * 3, 1, bias=False)
+        # 姘村钩鏂瑰悜娉ㄦ剰鍔?        self.to_qkv_h = nn.Conv2d(dim, dim * 3, 1, bias=False)
+        # 鍨傜洿鏂瑰悜娉ㄦ剰鍔?        self.to_qkv_v = nn.Conv2d(dim, dim * 3, 1, bias=False)
 
         self.scale = self.dim_head ** -0.5
 
     def forward(self, x):
         b, c, h, w = x.shape
 
-        # 水平方向处理
+        # 姘村钩鏂瑰悜澶勭悊
         qkv_h = self.to_qkv_h(x).chunk(3, dim=1)
         q_h, k_h, v_h = map(
             lambda t: t.permute(0, 2, 3, 1).reshape(b * h, w, self.heads, self.dim_head).permute(0, 2, 1, 3), qkv_h)
@@ -685,7 +682,7 @@ class AxialAttention(nn.Module):
         attn_h = attn_h.softmax(dim=-1)
         out_h = (attn_h @ v_h).permute(0, 2, 1, 3).reshape(b, h, w, c).permute(0, 3, 1, 2)
 
-        # 垂直方向处理
+        # 鍨傜洿鏂瑰悜澶勭悊
         qkv_v = self.to_qkv_v(x).chunk(3, dim=1)
         q_v, k_v, v_v = map(
             lambda t: t.permute(0, 3, 2, 1).reshape(b * w, h, self.heads, self.dim_head).permute(0, 2, 1, 3), qkv_v)
@@ -697,30 +694,28 @@ class AxialAttention(nn.Module):
 
 
 class AGFB(nn.Module):
-    """轴向门控融合块"""
+    """杞村悜闂ㄦ帶铻嶅悎鍧?""
 
     def __init__(self, dim, heads=4, expansion=2):
         super().__init__()
 
-        # 分支A：轴向注意力+通道注意力
-        self.branch_a = nn.Sequential(
+        # 鍒嗘敮A锛氳酱鍚戞敞鎰忓姏+閫氶亾娉ㄦ剰鍔?        self.branch_a = nn.Sequential(
             AxialAttention(dim, heads),
             nn.Conv2d(dim, dim // expansion, 1),
             nn.GELU(),
-            SqueezeExcitation(dim // expansion),  # SE模块
+            SqueezeExcitation(dim // expansion),  # SE妯″潡
             nn.Conv2d(dim // expansion, dim, 1)
         )
 
-        # 分支B：深度可分离卷积
+        # 鍒嗘敮B锛氭繁搴﹀彲鍒嗙鍗风Н
         self.branch_b = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),  # 深度卷积
-            nn.Conv2d(dim, dim * expansion, 1),  # 逐点卷积
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),  # 娣卞害鍗风Н
+            nn.Conv2d(dim, dim * expansion, 1),  # 閫愮偣鍗风Н
             nn.GELU(),
             nn.Conv2d(dim * expansion, dim, 1)
         )
 
-        # 动态门控融合
-        self.fusion_gate = nn.Sequential(
+        # 鍔ㄦ€侀棬鎺ц瀺鍚?        self.fusion_gate = nn.Sequential(
             nn.Conv2d(dim * 2, dim // 2, 1),
             nn.GELU(),
             nn.Conv2d(dim // 2, 2, 1),
@@ -731,15 +726,14 @@ class AGFB(nn.Module):
         a = self.branch_a(x)
         b = self.branch_b(x)
 
-        # 动态权重学习
-        gate = self.fusion_gate(torch.cat([a, b], dim=1))
+        # 鍔ㄦ€佹潈閲嶅涔?        gate = self.fusion_gate(torch.cat([a, b], dim=1))
         w_a, w_b = gate.chunk(2, dim=1)
 
         return x + a * w_a + b * w_b
 
 
 class SqueezeExcitation(nn.Module):
-    """通道注意力模块"""
+    """閫氶亾娉ㄦ剰鍔涙ā鍧?""
 
     def __init__(self, channel, reduction=4):
         super().__init__()
@@ -789,22 +783,20 @@ class MGSTA(nn.Module):
             nn.Conv2d(dim // 4, 1, 3, padding=1),
             nn.Sigmoid())
 
-        self.temporal_att = nn.Sequential(  # 模拟相邻CU关系
+        self.temporal_att = nn.Sequential(  # 妯℃嫙鐩搁偦CU鍏崇郴
             nn.Conv1d(dim, dim // 2, 3, padding=1),
             nn.ReLU(),
             nn.Conv1d(dim // 2, dim, 3, padding=1),
             nn.Sigmoid())
 
     def forward(self, x, qp):
-        # 空间注意力
-        spatial = self.spatial_att(x)
+        # 绌洪棿娉ㄦ剰鍔?        spatial = self.spatial_att(x)
 
-        # 伪时序注意力（模拟相邻块关系）
-        B, C, H, W = x.shape
+        # 浼椂搴忔敞鎰忓姏锛堟ā鎷熺浉閭诲潡鍏崇郴锛?        B, C, H, W = x.shape
         temporal = x.view(B, C, -1).mean(-1)
         temporal = self.temporal_att(temporal.unsqueeze(-1))
 
-        # QP条件调制
+        # QP鏉′欢璋冨埗
         qp_emb = self.qp_embed(qp).view(B, C, 1, 1)
         return x * spatial * temporal.view(B, C, 1, 1) * qp_emb
 
@@ -842,26 +834,25 @@ class DynamicReorgNet(nn.Module):
 class HeterogeneousBranch(nn.Module):
     def __init__(self, in_dim, out_dim, qp_types):
         super().__init__()
-        # 主分支：高频特征提取
+        # 涓诲垎鏀細楂橀鐗瑰緛鎻愬彇
         self.main_branch = nn.Sequential(
             DepthDecoupledConv(in_dim, 32, 5),
             nn.GELU(),
             DepthDecoupledConv(32, 64, 3))
 
-        # 辅助分支：低频特征提取
-        self.aux_branch = nn.Sequential(
+        # 杈呭姪鍒嗘敮锛氫綆棰戠壒寰佹彁鍙?        self.aux_branch = nn.Sequential(
             nn.AvgPool2d(3, stride=2, padding=1),
             DepthDecoupledConv(in_dim, 32, 3),
             nn.GELU())
 
-        # 特征重组模块
+        # 鐗瑰緛閲嶇粍妯″潡
         # self.fusion = nn.Sequential(
         #     DepthDecoupledConv(96, 128, 1),
         #     MGSTA(128, qp_types))
         self.conv = DepthDecoupledConv(96, 128, 1)
         self.fusion = MGSTA(128, qp_types)
         # self.fusion = MGSTA(16, qp_types)
-        # 动态预测头
+        # 鍔ㄦ€侀娴嬪ご
         self.head = DynamicReorgNet(128, out_dim, qp_types)
 
     def forward(self, x, qp):
@@ -882,33 +873,30 @@ class OptimizedHeterogeneousBranch(nn.Module):
       super().__init__()
       compressed_dim = int(in_dim * expansion_ratio)
 
-      # 共享基础卷积
+      # 鍏变韩鍩虹鍗风Н
       self.base_conv = nn.Sequential(
         nn.Conv2d(in_dim, compressed_dim, 3, padding=1),
         nn.GELU()
       )
 
-      # 轻量化主分支（高频特征）
+      # 杞婚噺鍖栦富鍒嗘敮锛堥珮棰戠壒寰侊級
       self.main_branch = nn.Sequential(
         DepthDecoupledConv(compressed_dim, compressed_dim, 5),
         nn.GELU(),
-        nn.Conv2d(compressed_dim, compressed_dim, 1)  # 通道重校准
-      )
+        nn.Conv2d(compressed_dim, compressed_dim, 1)  # 閫氶亾閲嶆牎鍑?      )
 
-      # 超轻量辅助分支（低频特征）
-      self.aux_branch = nn.Sequential(
+      # 瓒呰交閲忚緟鍔╁垎鏀紙浣庨鐗瑰緛锛?      self.aux_branch = nn.Sequential(
         nn.AvgPool2d(3, stride=2, padding=1),
         nn.Conv2d(compressed_dim, compressed_dim , 1),
         nn.GELU()
       )
 
-      # 高效特征融合（与AGFB协同设计）
-      self.fusion = nn.Sequential(
+      # 楂樻晥鐗瑰緛铻嶅悎锛堜笌AGFB鍗忓悓璁捐锛?      self.fusion = nn.Sequential(
         nn.Conv2d(compressed_dim *  2, compressed_dim, 1),
-        AGFB(compressed_dim, heads=2)  # 复用AGFB模块
+        AGFB(compressed_dim, heads=2)  # 澶嶇敤AGFB妯″潡
       )
 
-      # 轻量化预测头
+      # 杞婚噺鍖栭娴嬪ご
       self.head = nn.Sequential(
         nn.AdaptiveAvgPool2d(1),
         nn.Flatten(),
@@ -917,7 +905,7 @@ class OptimizedHeterogeneousBranch(nn.Module):
         nn.Linear(128, out_dim)
       )
 
-      # 动态QP调制
+      # 鍔ㄦ€丵P璋冨埗
       self.qp_modulation = nn.Sequential(
         nn.Embedding(qp_types, compressed_dim),
         nn.Linear(compressed_dim, compressed_dim * 2),
@@ -927,25 +915,24 @@ class OptimizedHeterogeneousBranch(nn.Module):
     def forward(self, x, qp=None):
       if qp == None:
         qp = torch.ones(x.shape[0], dtype=int) * 0
-      # 基础特征提取
+      # 鍩虹鐗瑰緛鎻愬彇
       x = self.base_conv(x)
 
-      # 分支处理
+      # 鍒嗘敮澶勭悊
       main = self.main_branch(x)
       aux = F.interpolate(self.aux_branch(x), size=x.shape[2:])
 
-      # QP调制
+      # QP璋冨埗
       qp_weights = self.qp_modulation(qp).unsqueeze(-1).unsqueeze(-1)
       scale, shift = qp_weights.chunk(2, dim=1)
 
-      # 动态特征融合
-      fused = self.fusion(torch.cat([
+      # 鍔ㄦ€佺壒寰佽瀺鍚?      fused = self.fusion(torch.cat([
         main * (1 + scale),
         aux * (1 - scale)
       ], dim=1))
 
-      # 残差连接
-      fused += x  # 利用基础特征
+      # 娈嬪樊杩炴帴
+      fused += x  # 鍒╃敤鍩虹鐗瑰緛
 
       return self.head(fused)
 
@@ -954,17 +941,16 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
   def __init__(self, in_dim, out_dim, qp_types):
     super().__init__()
 
-    # 增强特征整合
+    # 澧炲己鐗瑰緛鏁村悎
     self.feat_integration = nn.Sequential(
-      AGFB(in_dim),  # 前置AGFB已包含多分支融合
+      AGFB(in_dim),  # 鍓嶇疆AGFB宸插寘鍚鍒嗘敮铻嶅悎
       nn.Conv2d(in_dim, 64, 3, padding=1),
       nn.GELU()
     )
 
-    # 多粒度特征提取
-    self.multi_scale = nn.ModuleDict({
+    # 澶氱矑搴︾壒寰佹彁鍙?    self.multi_scale = nn.ModuleDict({
       'high': nn.Sequential(
-        nn.Conv2d(64, 64, 3, padding=1, groups=64),  # 深度卷积保持高频
+        nn.Conv2d(64, 64, 3, padding=1, groups=64),  # 娣卞害鍗风Н淇濇寔楂橀
         nn.GELU()),
       'low': nn.Sequential(
         nn.AvgPool2d(3, stride=2, padding=1),
@@ -972,12 +958,12 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
         nn.Upsample(scale_factor=2, mode='bilinear'))
     })
 
-    # 轻量级时空注意力
+    # 杞婚噺绾ф椂绌烘敞鎰忓姏
     self.fusion_att1 = nn.Conv2d(128, 64, 1)
     self.MGSTA = MGSTA(64, qp_types)
     self.fusion_att2 = nn.Conv2d(64, 128, 3, padding=1)
 
-    # 动态预测头
+    # 鍔ㄦ€侀娴嬪ご
     self.head = nn.Sequential(
       nn.AdaptiveAvgPool2d(4),
       nn.Flatten(),
@@ -990,21 +976,18 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
   def forward(self, x, qp=None):
     if qp == None:
       qp = torch.ones(x.shape[0], dtype=int) * 0
-    # 特征整合
+    # 鐗瑰緛鏁村悎
     x = self.feat_integration(x)
 
-    # 并行多尺度处理
-    high = self.multi_scale['high'](x)
+    # 骞惰澶氬昂搴﹀鐞?    high = self.multi_scale['high'](x)
     low = self.multi_scale['low'](x)
 
-    # 注意力融合
-    fused = torch.cat([high, low], dim=1)
+    # 娉ㄦ剰鍔涜瀺鍚?    fused = torch.cat([high, low], dim=1)
     fused = self.fusion_att1(fused)
     fused = self.MGSTA(fused,qp)
     fused = self.fusion_att2(fused)
 
-    # 动态预测
-    return self.head(fused)
+    # 鍔ㄦ€侀娴?    return self.head(fused)
 
 # class DynamicRoutingGate(nn.Module):
 #   def __init__(self, in_dim, num_experts):
@@ -1023,14 +1006,12 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
 # class DSC_Block(nn.Module):
 #   def __init__(self, ch_dim, spatial_dim):
 #     super().__init__()
-#     # 空间动态卷积
-#     self.spatial_conv = nn.Conv2d(ch_dim, ch_dim, 3,
+#     # 绌洪棿鍔ㄦ€佸嵎绉?#     self.spatial_conv = nn.Conv2d(ch_dim, ch_dim, 3,
 #                                   padding=1, groups=ch_dim)
-#     # 新增自适应下采样层
+#     # 鏂板鑷€傚簲涓嬮噰鏍峰眰
 #     self.downsample = nn.AdaptiveMaxPool2d((spatial_dim[0] // 2, spatial_dim[1] // 2))
-#     # 确保输出尺寸一致
-#     self.output_size = (spatial_dim[0] // 2, spatial_dim[1] // 2)
-#     # 通道交互模块
+#     # 纭繚杈撳嚭灏哄涓€鑷?#     self.output_size = (spatial_dim[0] // 2, spatial_dim[1] // 2)
+#     # 閫氶亾浜や簰妯″潡
 #     self.channel_mixer = nn.Sequential(
 #       nn.AdaptiveAvgPool2d(1),
 #       nn.Conv2d(ch_dim, ch_dim // 4, 1),
@@ -1038,19 +1019,16 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
 #       nn.Conv2d(ch_dim // 4, ch_dim, 1),
 #       nn.Sigmoid())
 #
-#     # 动态尺度适配
+#     # 鍔ㄦ€佸昂搴﹂€傞厤
 #     if min(spatial_dim) <= 8:
 #       self.resolution_keeper = nn.Identity()
 #     else:
 #       self.resolution_keeper = nn.MaxPool2d(2)
 #
 #   def forward(self, x):
-#     # 空间动态卷积
-#     spatial = self.spatial_conv(x)
-#     # 通道注意力
-#     channel = self.channel_mixer(x)
-#     # 动态融合
-#     out = spatial * channel + x
+#     # 绌洪棿鍔ㄦ€佸嵎绉?#     spatial = self.spatial_conv(x)
+#     # 閫氶亾娉ㄦ剰鍔?#     channel = self.channel_mixer(x)
+#     # 鍔ㄦ€佽瀺鍚?#     out = spatial * channel + x
 #     return self.resolution_keeper(out)
 #
 #
@@ -1059,17 +1037,17 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
 #     super().__init__()
 #     self.qp_embed = nn.Embedding(qp_size, 16)
 #
-#     # 构建动态路由块
+#     # 鏋勫缓鍔ㄦ€佽矾鐢卞潡
 #     self.blocks = nn.ModuleList([
 #       DSC_Block(16, spatial_size),
 #       DSC_Block(16, (spatial_size[0] // 2, spatial_size[1] // 2)),
 #       DSC_Block(16, (spatial_size[0] // 4, spatial_size[1] // 4))
 #     ])
 #
-#     # 动态路由门
+#     # 鍔ㄦ€佽矾鐢遍棬
 #     self.router = DynamicRoutingGate(32, len(self.blocks))
 #
-#     # 自适应输出模块
+#     # 鑷€傚簲杈撳嚭妯″潡
 #     self.adaptive_pool = nn.AdaptiveAvgPool2d(4)
 #     self.final_mixer = nn.Sequential(
 #       nn.Linear(16 * 16, 64),
@@ -1081,11 +1059,9 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
 #     # print(x.shape)
 #     qp_emb = self.qp_embed(qp_list)
 #
-#     # 动态路由
-#     route_weights = self.router(x, qp_emb)
+#     # 鍔ㄦ€佽矾鐢?#     route_weights = self.router(x, qp_emb)
 #
-#     # 多路径处理
-#     feature_maps = []
+#     # 澶氳矾寰勫鐞?#     feature_maps = []
 #     residual = x
 #     for i, block in enumerate(self.blocks):
 #       residual = block(residual)
@@ -1097,21 +1073,20 @@ class OptimizedHeterogeneousBranchv2(nn.Module):
 #       weighted = residual * weight_mask
 #       feature_maps.append(weighted)
 #
-#     # 特征融合
+#     # 鐗瑰緛铻嶅悎
 #     # print(feature_maps[0].shape)
 #     # print(feature_maps[1].shape)
 #     # print(feature_maps[2].shape)
 #     fused = sum(feature_maps)
 #
-#     # 分辨率适配
+#     # 鍒嗚鲸鐜囬€傞厤
 #     pooled = self.adaptive_pool(fused)
 #
-#     # QP信息融合
+#     # QP淇℃伅铻嶅悎
 #     qp_effect = qp_emb.unsqueeze(-1).unsqueeze(-1)
 #     enhanced = pooled * (1 + qp_effect)
 #
-#     # 最终预测
-#     flattened = enhanced.view(x.size(0), -1)
+#     # 鏈€缁堥娴?#     flattened = enhanced.view(x.size(0), -1)
 #     return self.final_mixer(flattened)
 
 class DynamicRoutingGate(nn.Module):
@@ -1121,7 +1096,7 @@ class DynamicRoutingGate(nn.Module):
         nn.Linear(in_dim, 128),
         nn.GELU(),
         nn.Linear(128, num_experts),
-        nn.Softmax(dim=1)
+        # nn.Softmax(dim=1)
       )
 
     def forward(self, x_feat, qp_emb):
@@ -1178,29 +1153,25 @@ class FeatureFuser(nn.Module):
 class DSC_Net(nn.Module):
   def __init__(self, out_dim, spatial_size, qp_size):
     super().__init__()
-    # 输入统一适配
+    # 杈撳叆缁熶竴閫傞厤
     self.input_adapter = nn.Conv2d(16, 64, 3, padding=1)
 
-    # QP嵌入层
-    self.qp_embed = nn.Embedding(qp_size, 64)
+    # QP宓屽叆灞?    self.qp_embed = nn.Embedding(qp_size, 64)
 
-    # 动态路由
-    self.router = DynamicRoutingGate(in_dim=128, num_experts=3)
+    # 鍔ㄦ€佽矾鐢?    self.router = DynamicRoutingGate(in_dim=128, num_experts=1)
 
-    # 特征处理块
-    base_size = (spatial_size[0] // 4, spatial_size[1] // 4)
+    # 鐗瑰緛澶勭悊鍧?    base_size = (spatial_size[0] // 4, spatial_size[1] // 4)
     # base_size = (spatial_size[0], spatial_size[1]) #ttttttest
     self.blocks = nn.ModuleList([
-      DSC_Block(64, target_size=base_size),
-      DSC_Block(64, target_size=base_size),
+      # DSC_Block(64, target_size=base_size),
+      # DSC_Block(64, target_size=base_size),
       DSC_Block(64, target_size=base_size)
     ])
 
-    # 特征融合
+    # 鐗瑰緛铻嶅悎
     self.fuser = FeatureFuser(target_size=base_size)
 
-    # 输出层
-    self.final = nn.Sequential(
+    # 杈撳嚭灞?    self.final = nn.Sequential(
       nn.Conv2d(64, 32, 1),
       nn.ReLU(),
       nn.Flatten(),
@@ -1209,29 +1180,29 @@ class DSC_Net(nn.Module):
       nn.Linear(128, out_dim)
     )
 
-  def forward(self, x, qp_list):
-    # 输入处理
+  def forward(self, x, qp_list=None):
+    if qp_list == None:
+      qp_list = torch.ones(x.shape[0], dtype=int) * 0
+    # 杈撳叆澶勭悊
     x = self.input_adapter(x)
     B, C, H, W = x.shape
 
-    # QP信息融合
+    # QP淇℃伅铻嶅悎
     qp_emb = self.qp_embed(qp_list)
 
-    # 路由权重生成
+    # 璺敱鏉冮噸鐢熸垚
     route_weights = self.router(x, qp_emb)  # [B, 3]
 
-    # 多路径处理
-    feature_maps = []
+    # 澶氳矾寰勫鐞?    feature_maps = []
     for i, block in enumerate(self.blocks):
       weighted_x = x * route_weights[:, i].view(B, 1, 1, 1)
       processed = block(weighted_x)
       feature_maps.append(processed)
 
-    # 特征融合
+    # 鐗瑰緛铻嶅悎
     fused = self.fuser(feature_maps)
 
-    # 最终输出
-    return self.final(fused)
+    # 鏈€缁堣緭鍑?    return self.final(fused)
 
 class ChannelAdaptiveAttention(nn.Module):
 
@@ -1260,7 +1231,7 @@ class ChannelAdaptiveAttention(nn.Module):
 
 
 class MultiScaleDepthwiseConv(nn.Module):
-  """多尺度深度可分离卷积"""
+  """澶氬昂搴︽繁搴﹀彲鍒嗙鍗风Н"""
 
   def __init__(self, in_channels, out_channels):
     super().__init__()
@@ -1283,7 +1254,7 @@ class MultiScaleDepthwiseConv(nn.Module):
 
 
 class AdaptiveFeatureFusion(nn.Module):
-  """自适应特征融合模块"""
+  """鑷€傚簲鐗瑰緛铻嶅悎妯″潡"""
 
   def __init__(self, dim):
     super().__init__()
@@ -1303,22 +1274,20 @@ class AdaptiveFeatureFusion(nn.Module):
 
 
 class EnhancedFeatureExtractor(nn.Module):
-  """增强型特征提取网络"""
+  """澧炲己鍨嬬壒寰佹彁鍙栫綉缁?""
 
   def __init__(self, dim=192, expansion_ratio=4):
     super().__init__()
     hidden_dim = dim * expansion_ratio
 
     self.net = nn.Sequential(
-      # 特征重组层
-      nn.Conv2d(dim, hidden_dim, 1),
+      # 鐗瑰緛閲嶇粍灞?      nn.Conv2d(dim, hidden_dim, 1),
       nn.BatchNorm2d(hidden_dim),
       nn.ReLU(inplace=True),
 
-      # 多尺度特征提取
-      AdaptiveFeatureFusion(hidden_dim),
+      # 澶氬昂搴︾壒寰佹彁鍙?      AdaptiveFeatureFusion(hidden_dim),
 
-      # 通道压缩
+      # 閫氶亾鍘嬬缉
       nn.Conv2d(hidden_dim, dim, 1),
       nn.BatchNorm2d(dim)
     )
@@ -1332,8 +1301,9 @@ class EnhancedFeatureExtractor(nn.Module):
     identity = x
     residual = self.net(x)
 
-    # 自适应门控机制
+    # 鑷€傚簲闂ㄦ帶鏈哄埗
     gate = self.att_gate(x)
     out = identity + residual * gate
+    # out = identity + residual
 
     return out
